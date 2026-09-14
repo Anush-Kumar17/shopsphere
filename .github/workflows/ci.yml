@@ -1,4 +1,4 @@
-name: ShopSphere CI
+name: ShopSphere CI/CD
 
 on:
   push:
@@ -9,37 +9,190 @@ on:
     branches:
       - main
 
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: shopsphere-backend
+  S3_BUCKET: shopsphere-frontend-anush-2026
+  ECR_REGISTRY: 163885031670.dkr.ecr.ap-south-1.amazonaws.com
+
 jobs:
-  build-and-test:
+
+  build-and-deploy:
     runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
 
+      # ==========================================
+      # 1. Checkout code
+      # ==========================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+
+      # ==========================================
+      # 2. Setup Node.js
+      # ==========================================
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
+
+      # ==========================================
+      # 3. Backend - Install dependencies
+      # ==========================================
+
       - name: Install backend dependencies
         working-directory: backend
         run: npm ci
 
+
+      # ==========================================
+      # 4. Backend - Build Docker image
+      # ==========================================
+
       - name: Build backend Docker image
-        run: docker build -t shopsphere-backend ./backend
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} \
+            ./backend
+
+
+      # ==========================================
+      # 5. Frontend - Install dependencies
+      # ==========================================
 
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
 
+
+      # ==========================================
+      # 6. Frontend - Production build
+      # ==========================================
+
       - name: Build frontend
         working-directory: frontend
         run: npm run build
 
-      - name: Build frontend Docker image
-        run: docker build -t shopsphere-frontend ./frontend
 
-      - name: CI completed
-        run: echo "ShopSphere CI completed successfully!"
+      # ==========================================
+      # 7. Configure AWS
+      # Only on push to main
+      # ==========================================
+
+      - name: Configure AWS credentials
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      # ==========================================
+      # 8. Login to Amazon ECR
+      # ==========================================
+
+      - name: Login to Amazon ECR
+        if: github.event_name == 'push'
+        uses: aws-actions/amazon-ecr-login@v2
+
+
+      # ==========================================
+      # 9. Push Docker image to ECR
+      # ==========================================
+
+      - name: Push backend image to ECR
+        if: github.event_name == 'push'
+        run: |
+          docker push \
+            $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+
+          docker tag \
+            $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} \
+            $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          docker push \
+            $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+
+      # ==========================================
+      # 10. Deploy frontend to S3
+      # ==========================================
+
+      - name: Deploy frontend to S3
+        if: github.event_name == 'push'
+        run: |
+          aws s3 sync frontend/dist s3://$S3_BUCKET --delete
+
+
+      # ==========================================
+      # 11. Deploy backend to both EC2 instances
+      # ==========================================
+
+      - name: Deploy backend to EC2
+        if: github.event_name == 'push'
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=InstanceIds,Values=i-00738eb70d830fefc,i-0b068a576728ca471" \
+            --parameters 'commands=[
+              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 163885031670.dkr.ecr.ap-south-1.amazonaws.com",
+              "docker pull 163885031670.dkr.ecr.ap-south-1.amazonaws.com/shopsphere-backend:${{ github.sha }}",
+              "if [ ! -f /home/ec2-user/shopsphere.env ]; then docker inspect shopsphere-backend --format '\\''{{range .Config.Env}}{{println .}}{{end}}'\\'' | grep -E '\\''^(DB_HOST|DB_PORT|DB_USER|DB_PASSWORD|DB_NAME|JWT_SECRET|PORT)='\\'' > /home/ec2-user/shopsphere.env; chmod 600 /home/ec2-user/shopsphere.env; fi",
+              "docker stop shopsphere-backend || true",
+              "docker rm shopsphere-backend || true",
+              "docker run -d --name shopsphere-backend --restart unless-stopped --env-file /home/ec2-user/shopsphere.env -p 5000:5000 163885031670.dkr.ecr.ap-south-1.amazonaws.com/shopsphere-backend:${{ github.sha }}",
+              "sleep 10",
+              "curl --fail --silent http://localhost:5000/api/products > /dev/null"
+            ]' \
+            --region ap-south-1 \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          for INSTANCE_ID in i-00738eb70d830fefc i-0b068a576728ca471
+          do
+            echo "Waiting for deployment on $INSTANCE_ID..."
+
+            aws ssm wait command-executed \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region ap-south-1
+
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region ap-south-1 \
+              --query "Status" \
+              --output text)
+
+            echo "$INSTANCE_ID deployment status: $STATUS"
+
+            if [ "$STATUS" != "Success" ]; then
+              echo "Deployment failed on $INSTANCE_ID"
+              exit 1
+            fi
+          done
+
+
+      # ==========================================
+      # 12. Deployment completed
+      # ==========================================
+
+      - name: Deployment completed
+        if: github.event_name == 'push'
+        run: |
+          echo "=========================================="
+          echo "ShopSphere CI/CD deployment completed!"
+          echo "Frontend deployed to S3"
+          echo "Backend image pushed to ECR"
+          echo "Backend deployed to EC2 #1 and EC2 #2"
+          echo "=========================================="

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import AdminDashboard from "./AdminDashboard";
 
-const API_URL = "http://localhost:5000/api";
+const API_URL = "http://shopsphere-alb-1764685277.ap-south-1.elb.amazonaws.com/api";
 
 function App() {
     // =========================
